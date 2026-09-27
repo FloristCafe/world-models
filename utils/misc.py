@@ -132,12 +132,12 @@ class RolloutGenerator(object):
 
         # load controller if it was previously saved
         if exists(ctrl_file):
-            ctrl_state = torch.load(ctrl_file, map_location={'cuda:0': str(device)})
+            ctrl_state = torch.load(ctrl_file, map_location={'cuda:0': str(device)},weights_only=False)
             print("Loading Controller with reward {}".format(
                 ctrl_state['reward']))
             self.controller.load_state_dict(ctrl_state['state_dict'])
 
-        self.env = gym.make('CarRacing-v0')
+        self.env = gym.make('CarRacing-v2')
         self.device = device
 
         self.time_limit = time_limit
@@ -161,21 +161,29 @@ class RolloutGenerator(object):
         _, _, _, _, _, next_hidden = self.mdrnn(action, latent_mu, hidden)
         return action.squeeze().cpu().numpy(), next_hidden
 
-    def rollout(self, params, render=False):
+    def rollout(self, params, render=False, steering_smoothing=0.0):
         """ Execute a rollout and returns minus cumulative reward.
 
         Load :params: into the controller and execute a single rollout. This
         is the main API of this class.
 
         :args params: parameters as a single 1D np array
+        :args steering_smoothing: EMA coefficient applied only to steering.
+            A value of 0 disables smoothing; values closer to 1 produce
+            smoother but slower steering responses.
 
         :returns: minus cumulative reward
         """
+        if not 0.0 <= steering_smoothing < 1.0:
+            raise ValueError('steering_smoothing must be in [0, 1).')
+
         # copy params into the controller
         if params is not None:
             load_parameters(params, self.controller)
 
-        obs = self.env.reset()
+        # 【修复1：兼容 Gymnasium v2 的 reset 返回值】
+        reset_result = self.env.reset()
+        obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
 
         # This first render is required !
         self.env.render()
@@ -183,16 +191,39 @@ class RolloutGenerator(object):
         hidden = [
             torch.zeros(1, RSIZE).to(self.device)
             for _ in range(2)]
+        previous_steering = 0.0
 
         cumulative = 0
         i = 0
         while True:
             obs = transform(obs).unsqueeze(0).to(self.device)
-            action, hidden = self.get_action_and_transition(obs, hidden)
-            obs, reward, done, _ = self.env.step(action)
+            _, latent_mu, _ = self.vae(obs)
+            action = self.controller(latent_mu, hidden[0])
+
+            if steering_smoothing:
+                action = action.clone()
+                raw_steering = action[0, 0].item()
+                smoothed_steering = (
+                    steering_smoothing * previous_steering
+                    + (1.0 - steering_smoothing) * raw_steering
+                )
+                action[0, 0] = smoothed_steering
+                previous_steering = smoothed_steering
+            
+            # 【修复2：兼容 Gymnasium v2 的 step 返回值】
+            step_result = self.env.step(action.squeeze().cpu().numpy())
+            
+            if len(step_result) == 4:
+                obs, reward, done, info = step_result
+            else: # len(step_result) == 5 (Gymnasium v2)
+                obs, reward, terminated, truncated, info = step_result
+                done = terminated or truncated
 
             if render:
                 self.env.render()
+
+            _, _, _, _, _, next_hidden = self.mdrnn(action, latent_mu, hidden)
+            hidden = next_hidden
 
             cumulative += reward
             if done or i > self.time_limit:

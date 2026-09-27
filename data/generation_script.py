@@ -32,5 +32,6 @@ def _threaded_generation(i):
     return True
 
 
-with Pool(args.threads) as p:
-    p.map(_threaded_generation, range(args.threads))
+if __name__ == '__main__':
+    with Pool(args.threads) as p:
+        res = p.map(_threaded_generation, range(args.threads))

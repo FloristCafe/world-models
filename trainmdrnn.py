@@ -19,78 +19,13 @@ from data.loaders import RolloutSequenceDataset
 from models.vae import VAE
 from models.mdrnn import MDRNN, gmm_loss
 
-parser = argparse.ArgumentParser("MDRNN training")
-parser.add_argument('--logdir', type=str,
-                    help="Where things are logged and models are loaded from.")
-parser.add_argument('--noreload', action='store_true',
-                    help="Do not reload if specified.")
-parser.add_argument('--include_reward', action='store_true',
-                    help="Add a reward modelisation term to the loss.")
-args = parser.parse_args()
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-# constants
-BSIZE = 16
-SEQ_LEN = 32
-epochs = 30
-
-# Loading VAE
-vae_file = join(args.logdir, 'vae', 'best.tar')
-assert exists(vae_file), "No trained VAE in the logdir..."
-state = torch.load(vae_file)
-print("Loading VAE at epoch {} "
-      "with test error {}".format(
-          state['epoch'], state['precision']))
-
-vae = VAE(3, LSIZE).to(device)
-vae.load_state_dict(state['state_dict'])
-
-# Loading model
-rnn_dir = join(args.logdir, 'mdrnn')
-rnn_file = join(rnn_dir, 'best.tar')
-
-if not exists(rnn_dir):
-    mkdir(rnn_dir)
-
-mdrnn = MDRNN(LSIZE, ASIZE, RSIZE, 5)
-mdrnn.to(device)
-optimizer = torch.optim.RMSprop(mdrnn.parameters(), lr=1e-3, alpha=.9)
-scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5)
-earlystopping = EarlyStopping('min', patience=30)
-
-
-if exists(rnn_file) and not args.noreload:
-    rnn_state = torch.load(rnn_file)
-    print("Loading MDRNN at epoch {} "
-          "with test error {}".format(
-              rnn_state["epoch"], rnn_state["precision"]))
-    mdrnn.load_state_dict(rnn_state["state_dict"])
-    optimizer.load_state_dict(rnn_state["optimizer"])
-    scheduler.load_state_dict(state['scheduler'])
-    earlystopping.load_state_dict(state['earlystopping'])
-
-
-# Data Loading
-transform = transforms.Lambda(
-    lambda x: np.transpose(x, (0, 3, 1, 2)) / 255)
-train_loader = DataLoader(
-    RolloutSequenceDataset('datasets/carracing', SEQ_LEN, transform, buffer_size=30),
-    batch_size=BSIZE, num_workers=8, shuffle=True)
-test_loader = DataLoader(
-    RolloutSequenceDataset('datasets/carracing', SEQ_LEN, transform, train=False, buffer_size=10),
-    batch_size=BSIZE, num_workers=8)
+# ==========================================
+# 1. 函数定义区：必须留在全局，供子进程合法调用
+# ==========================================
+def transform_obs(x):
+    return np.transpose(x, (0, 3, 1, 2)) / 255.0
 
 def to_latent(obs, next_obs):
-    """ Transform observations to latent space.
-
-    :args obs: 5D torch tensor (BSIZE, SEQ_LEN, ASIZE, SIZE, SIZE)
-    :args next_obs: 5D torch tensor (BSIZE, SEQ_LEN, ASIZE, SIZE, SIZE)
-
-    :returns: (latent_obs, latent_next_obs)
-        - latent_obs: 4D torch tensor (BSIZE, SEQ_LEN, LSIZE)
-        - next_latent_obs: 4D torch tensor (BSIZE, SEQ_LEN, LSIZE)
-    """
     with torch.no_grad():
         obs, next_obs = [
             f.upsample(x.view(-1, 3, SIZE, SIZE), size=RED_SIZE,
@@ -106,25 +41,7 @@ def to_latent(obs, next_obs):
             [(obs_mu, obs_logsigma), (next_obs_mu, next_obs_logsigma)]]
     return latent_obs, latent_next_obs
 
-def get_loss(latent_obs, action, reward, terminal,
-             latent_next_obs, include_reward: bool):
-    """ Compute losses.
-
-    The loss that is computed is:
-    (GMMLoss(latent_next_obs, GMMPredicted) + MSE(reward, predicted_reward) +
-         BCE(terminal, logit_terminal)) / (LSIZE + 2)
-    The LSIZE + 2 factor is here to counteract the fact that the GMMLoss scales
-    approximately linearily with LSIZE. All losses are averaged both on the
-    batch and the sequence dimensions (the two first dimensions).
-
-    :args latent_obs: (BSIZE, SEQ_LEN, LSIZE) torch tensor
-    :args action: (BSIZE, SEQ_LEN, ASIZE) torch tensor
-    :args reward: (BSIZE, SEQ_LEN) torch tensor
-    :args latent_next_obs: (BSIZE, SEQ_LEN, LSIZE) torch tensor
-
-    :returns: dictionary of losses, containing the gmm, the mse, the bce and
-        the averaged loss.
-    """
+def get_loss(latent_obs, action, reward, terminal, latent_next_obs, include_reward: bool):
     latent_obs, action,\
         reward, terminal,\
         latent_next_obs = [arr.transpose(1, 0)
@@ -144,9 +61,8 @@ def get_loss(latent_obs, action, reward, terminal,
     return dict(gmm=gmm, bce=bce, mse=mse, loss=loss)
 
 
-def data_pass(epoch, train, include_reward): # pylint: disable=too-many-locals
-    """ One pass through the data """
-    if train:
+def data_pass(epoch, is_training, include_reward): # 避免与下方 partial 变量重名引发混淆
+    if is_training:
         mdrnn.train()
         loader = train_loader
     else:
@@ -167,10 +83,9 @@ def data_pass(epoch, train, include_reward): # pylint: disable=too-many-locals
         # transform obs
         latent_obs, latent_next_obs = to_latent(obs, next_obs)
 
-        if train:
+        if is_training:
             losses = get_loss(latent_obs, action, reward,
                               terminal, latent_next_obs, include_reward)
-
             optimizer.zero_grad()
             losses['loss'].backward()
             optimizer.step()
@@ -194,29 +109,91 @@ def data_pass(epoch, train, include_reward): # pylint: disable=too-many-locals
     return cum_loss * BSIZE / len(loader.dataset)
 
 
-train = partial(data_pass, train=True, include_reward=args.include_reward)
-test = partial(data_pass, train=False, include_reward=args.include_reward)
+# ==========================================
+# 2. 隔离执行区：阻断子进程的无限制繁衍
+# ==========================================
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser("MDRNN training")
+    parser.add_argument('--logdir', type=str,
+                        help="Where things are logged and models are loaded from.")
+    parser.add_argument('--noreload', action='store_true',
+                        help="Do not reload if specified.")
+    parser.add_argument('--include_reward', action='store_true',
+                        help="Add a reward modelisation term to the loss.")
+    args = parser.parse_args()
 
-cur_best = None
-for e in range(epochs):
-    train(e)
-    test_loss = test(e)
-    scheduler.step(test_loss)
-    earlystopping.step(test_loss)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    is_best = not cur_best or test_loss < cur_best
-    if is_best:
-        cur_best = test_loss
-    checkpoint_fname = join(rnn_dir, 'checkpoint.tar')
-    save_checkpoint({
-        "state_dict": mdrnn.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        'scheduler': scheduler.state_dict(),
-        'earlystopping': earlystopping.state_dict(),
-        "precision": test_loss,
-        "epoch": e}, is_best, checkpoint_fname,
-                    rnn_file)
+    # constants
+    BSIZE = 16
+    SEQ_LEN = 32
+    epochs = 30
 
-    if earlystopping.stop:
-        print("End of Training because of early stopping at epoch {}".format(e))
-        break
+    # Loading VAE
+    vae_file = join(args.logdir, 'vae', 'best.tar')
+    assert exists(vae_file), "No trained VAE in the logdir..."
+    state = torch.load(vae_file)
+    print("Loading VAE at epoch {} with test error {}".format(
+        state['epoch'], state['precision']))
+
+    vae = VAE(3, LSIZE).to(device)
+    vae.load_state_dict(state['state_dict'])
+
+    # Loading model
+    rnn_dir = join(args.logdir, 'mdrnn')
+    rnn_file = join(rnn_dir, 'best.tar')
+
+    if not exists(rnn_dir):
+        mkdir(rnn_dir)
+
+    mdrnn = MDRNN(LSIZE, ASIZE, RSIZE, 5)
+    mdrnn.to(device)
+    optimizer = torch.optim.RMSprop(mdrnn.parameters(), lr=1e-3, alpha=.9)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=5)
+    earlystopping = EarlyStopping('min', patience=30)
+
+    if exists(rnn_file) and not args.noreload:
+        rnn_state = torch.load(rnn_file)
+        print("Loading MDRNN at epoch {} with test error {}".format(
+            rnn_state["epoch"], rnn_state["precision"]))
+        mdrnn.load_state_dict(rnn_state["state_dict"])
+        optimizer.load_state_dict(rnn_state["optimizer"])
+        scheduler.load_state_dict(state['scheduler'])
+        earlystopping.load_state_dict(state['earlystopping'])
+
+    # Data Loading
+    transform = transforms.Lambda(transform_obs)
+    # 这里的 num_workers=8 在隔离后终于可以安全执行了
+    train_loader = DataLoader(
+        RolloutSequenceDataset('datasets/carracing', SEQ_LEN, transform, buffer_size=30),
+        batch_size=BSIZE, num_workers=8, shuffle=True)
+    test_loader = DataLoader(
+        RolloutSequenceDataset('datasets/carracing', SEQ_LEN, transform, train=False, buffer_size=10),
+        batch_size=BSIZE, num_workers=8)
+
+    train_loop = partial(data_pass, is_training=True, include_reward=args.include_reward)
+    test_loop = partial(data_pass, is_training=False, include_reward=args.include_reward)
+
+    cur_best = None
+    for e in range(epochs):
+        train_loop(e)
+        test_loss = test_loop(e)
+        scheduler.step(test_loss)
+        earlystopping.step(test_loss)
+
+        is_best = not cur_best or test_loss < cur_best
+        if is_best:
+            cur_best = test_loss
+            
+        checkpoint_fname = join(rnn_dir, 'checkpoint.tar')
+        save_checkpoint({
+            "state_dict": mdrnn.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'earlystopping': earlystopping.state_dict(),
+            "precision": test_loss,
+            "epoch": e}, is_best, checkpoint_fname, rnn_file)
+
+        if earlystopping.stop:
+            print("End of Training because of early stopping at epoch {}".format(e))
+            break

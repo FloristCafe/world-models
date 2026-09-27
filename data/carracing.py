@@ -12,12 +12,14 @@ def generate_data(rollouts, data_dir, noise_type): # pylint: disable=R0914
     """ Generates data """
     assert exists(data_dir), "The data directory does not exist..."
 
-    env = gym.make("CarRacing-v0")
+    env = gym.make("CarRacing-v2")
     seq_len = 1000
 
     for i in range(rollouts):
-        env.reset()
-        env.env.viewer.window.dispatch_events()
+        # 修复 1：适配新版 reset 解包
+        s, _ = env.reset() 
+        # 删除了彻底失效的 Pyglet dispatch_events 调用
+
         if noise_type == 'white':
             a_rollout = [env.action_space.sample() for _ in range(seq_len)]
         elif noise_type == 'brown':
@@ -32,12 +34,18 @@ def generate_data(rollouts, data_dir, noise_type): # pylint: disable=R0914
             action = a_rollout[t]
             t += 1
 
-            s, r, done, _ = env.step(action)
-            env.env.viewer.window.dispatch_events()
+            # 修复 2：适配新版 step 的 5 变量解包机制
+            s, r, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            
+            # 删除了彻底失效的 Pyglet dispatch_events 调用
+            
             s_rollout += [s]
             r_rollout += [r]
             d_rollout += [done]
-            if done:
+            
+            # 增加越界保护，防止动作序列耗尽引发 IndexError
+            if done or t >= seq_len:
                 print("> End of rollout {}, {} frames...".format(i, len(s_rollout)))
                 np.savez(join(data_dir, 'rollout_{}'.format(i)),
                          observations=np.array(s_rollout),

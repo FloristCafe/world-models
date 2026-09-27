@@ -7,3 +7,45 @@ Dockerfile
 frames/
 dock_config.json
 .mypy_cache
+
+# Local environments and editor state
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Experiment outputs and model checkpoints
+exp_dir/
+runs/
+run/
+checkpoints/
+artifacts/
+wandb/
+mlruns/
+*.ckpt
+*.pt
+*.pth
+*.tar
+*.tar.gz
+
+# Generated experiment media and metrics
+samples/
+videos/
+*.npz
+*.npy
+*.pickle
+*.pkl
+*.jsonl
+*.csv
+*.tsv
+
+# Logs and runtime files
+*.log
+*.out
+*.err
+*.pid
+.coverage
+htmlcov/
